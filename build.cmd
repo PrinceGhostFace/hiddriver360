@@ -10,9 +10,11 @@ set "PATH=%TP%\bin\win32;%XDK%\bin\win32;%PATH%"
 set "INCLUDE=%TP%\include\xbox;%XDK%\include\xbox"
 set "LIB=%TP%\lib\xbox;%XDK%\lib\xbox"
 
-rem "build.cmd bootlog" makes a debug build that logs every init step to hiddriver_boot.log on the usb drive
+rem "build.cmd bootlog" makes a debug build that logs every init step to hiddriver_boot.log on the usb drive,
+rem "build.cmd giptrace" one that keeps a GIP trace ring for tools\giptrace.py to follow over xbdm
 set "DEFINES="
 if /i "%~1"=="bootlog" set "DEFINES=/D BOOTLOG"
+if /i "%~1"=="giptrace" set "DEFINES=/D GIPTRACE"
 
 set "SRC=%~dp0hiddriver"
 set "OUT=%~dp0build"

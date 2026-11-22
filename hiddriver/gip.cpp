@@ -43,8 +43,73 @@ const GipInitPacket* GipNextInitPacket(uint16_t vendorId, uint16_t productId, in
 	return nullptr;
 }
 
-uint8_t GipBuildAck(const uint8_t* packet, uint8_t* out) {
-	const uint8_t ack[] = { GIP_CMD_ACK, GIP_OPT_INTERNAL, packet[2], 0x09, 0x00, packet[0], GIP_OPT_INTERNAL, packet[3], 0x00, 0x00, 0x00, 0x00, 0x00 };
+const uint8_t gipIdentifyRequest[4] = { GIP_CMD_IDENTIFY, GIP_OPT_INTERNAL, 0x00, 0x00 };
+
+// What a Windows host sends after the identify descriptor (XboxInput's capture): a power packet carrying the
+// locale, power on, then the Xbox button LED at brightness 20
+static const uint8_t locale[] = { GIP_CMD_POWER, GIP_OPT_INTERNAL, 0x00, 0x0F, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 'U', 'S', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+static const uint8_t led_on[] = { GIP_CMD_LED, GIP_OPT_INTERNAL, 0x00, 0x03, 0x00, 0x01, 0x14 };
+
+static const GipInitPacket startupPackets[] = {
+	INIT_PACKET(0x0000, 0x0000, locale),
+	INIT_PACKET(0x0000, 0x0000, power_on),
+	INIT_PACKET(0x0000, 0x0000, led_on),
+};
+
+const GipInitPacket* GipNextStartupPacket(int* cursor) {
+	if (*cursor >= (int)(sizeof(startupPackets) / sizeof(startupPackets[0])))
+		return nullptr;
+	return &startupPackets[(*cursor)++];
+}
+
+static int DecodeVarint(const uint8_t* data, uint32_t length, uint32_t* value) {
+	uint32_t decoded = 0;
+	for (uint32_t i = 0; i < 4 && i < length; i++) {
+		decoded |= (uint32_t)(data[i] & 0x7F) << (i * 7);
+		if (!(data[i] & 0x80)) {
+			*value = decoded;
+			return i + 1;
+		}
+	}
+	return 0;
+}
+
+bool GipDecodeHeader(const uint8_t* data, uint32_t length, GipHeader* header) {
+	if (length < 4)
+		return false;
+	header->command = data[0];
+	header->options = data[1];
+	header->sequence = data[2];
+	header->chunkOffset = 0;
+
+	uint32_t offset = 3;
+	int used = DecodeVarint(data + offset, length - offset, &header->length);
+	if (!used)
+		return false;
+	offset += used;
+	if (header->options & GIP_OPT_CHUNK) {
+		used = DecodeVarint(data + offset, length - offset, &header->chunkOffset);
+		if (!used)
+			return false;
+		offset += used;
+	}
+	header->headerLength = offset;
+	return offset + header->length <= length;
+}
+
+// The ack echoes the acked packet's sequence and says how much of it arrived and how much is still to come
+uint8_t GipBuildAck(const GipHeader* header, uint32_t* chunkTotal, uint8_t* out) {
+	uint32_t received = header->length;
+	uint32_t remaining = 0;
+	if (header->options & GIP_OPT_CHUNK) {
+		if (header->options & GIP_OPT_CHUNK_START)
+			*chunkTotal = header->chunkOffset;
+		else
+			received += header->chunkOffset;
+		remaining = *chunkTotal > received ? *chunkTotal - received : 0;
+	}
+	const uint8_t ack[] = { GIP_CMD_ACK, GIP_OPT_INTERNAL, header->sequence, 0x09, 0x00, header->command, GIP_OPT_INTERNAL,
+		(uint8_t)received, (uint8_t)(received >> 8), 0x00, 0x00, (uint8_t)remaining, (uint8_t)(remaining >> 8) };
 	memcpy(out, ack, sizeof(ack));
 	return sizeof(ack);
 }
