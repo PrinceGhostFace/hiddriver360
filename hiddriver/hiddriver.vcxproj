@@ -90,11 +90,13 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="Detours.h" />
+    <ClInclude Include="gip.h" />
     <ClInclude Include="hid_parser.h" />
     <ClInclude Include="mapping.h" />
     <ClInclude Include="usb.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="gip.cpp" />
     <ClCompile Include="hid_parser.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Detours.cpp" />

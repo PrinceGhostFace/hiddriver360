@@ -11,6 +11,7 @@
 #include "hid_parser.h"  
 #include "usb.h"
 #include "mapping.h"
+#include "gip.h"
 
 Detour HidAddDeviceDetour;
 Detour HidRemoveDeviceDetour;
@@ -1379,6 +1380,349 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 	return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
 }
 
+// GIP (Xbox One / Series controllers) start
+// GIP devices aren't HID, so HidAddDevice never sees them and no built in driver claims their interface.
+// Instead of hooking anything, register our own usbd driver object: usbd asks every registered driver about
+// a new interface before falling back to its built in ones (UsbdGetInterfaceLevelDriverObject).
+struct UsbdDriverObject;
+// usbd passes the interface descriptor it's looking for a driver for, and the device descriptor
+typedef BOOL(*usbd_match_interface_func_t)(const uint8_t* interfaceDescriptor, const uint8_t* deviceDescriptor, UsbdDriverObject* driverObject);
+typedef NTSTATUS(*usbd_register_driver_object_func_t)(UsbdDriverObject* driverObject);
+
+// Same layout as the kernel's own driver objects (HidUsbdDriverObject, WgcUsbdDriverObject)
+struct UsbdDriverObject {
+	LIST_ENTRY listEntry;       // owned by usbd, has to be zero when registering
+	DWORD flags;                // 0x00020000 like WgcUsbdDriverObject, an interface level driver
+	int(*addDevice)(deviceHandle* handle);
+	int(*removeDevice)(deviceHandle* handle);
+	usbd_match_interface_func_t matchInterface;
+	void* addDeviceNotify;      // optional, called after addDevice
+};
+
+usbd_register_driver_object_func_t UsbdRegisterDriverObject = nullptr;
+
+#ifndef STATUS_UNSUCCESSFUL
+#define STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001L)
+#endif
+
+#define GIP_QUEUE_SIZE 8
+
+struct GipDevice {
+	deviceHandle* handle;
+	UsbTrb inTrb;
+	UsbTrb outTrb;
+	UsbTrb closeTrb;            // used to close the endpoints one after another on removal
+	UsbControlTrb controlTrb;
+	uint8_t* inBuffer;
+	uint8_t* outBuffer;
+	uint16_t inPacketSize;
+	uint16_t vendorId;
+	uint16_t productId;
+	int slot;                   // index into connectedControllers, -1 until bound
+	uint8_t sequence;
+	volatile bool inUse;        // pool entry taken, cleared after UsbdRemoveDeviceComplete
+	volatile bool active;       // cleared on removal, completions stop requeueing
+	DWORD lock;               // xkelib spinlock
+	bool outBusy;
+	uint8_t queue[GIP_QUEUE_SIZE][GIP_MAX_PACKET];
+	uint8_t queueLength[GIP_QUEUE_SIZE];
+	uint8_t queueHead;
+	uint8_t queueCount;
+	uint16_t lastLeftMotor;
+	uint16_t lastRightMotor;
+	uint32_t packetsLogged;
+};
+
+// A fixed pool so a late usb completion can never land on freed memory
+GipDevice gipDevices[4];
+
+int32_t GipInterruptOutComplete(DWORD trb, int32_t status);
+
+void GipSendNext(GipDevice* device) {
+	BYTE irql = KfAcquireSpinLock(&device->lock);
+	if (device->outBusy || !device->queueCount || !device->active) {
+		KfReleaseSpinLock(&device->lock, irql);
+		return;
+	}
+	uint8_t length = device->queueLength[device->queueHead];
+	memcpy(device->outBuffer, device->queue[device->queueHead], length);
+	device->queueHead = (device->queueHead + 1) % GIP_QUEUE_SIZE;
+	device->queueCount--;
+	device->outBusy = true;
+	KfReleaseSpinLock(&device->lock, irql);
+
+	SendInterruptRequest(device->handle, &device->outTrb, device->outBuffer, length, (DWORD)GipInterruptOutComplete);
+}
+
+// setSequence: give the packet our next sequence number (acks echo the device's instead)
+void GipQueuePacket(GipDevice* device, const uint8_t* data, uint8_t length, bool setSequence) {
+	BYTE irql = KfAcquireSpinLock(&device->lock);
+	if (device->queueCount == GIP_QUEUE_SIZE || length > GIP_MAX_PACKET) {
+		KfReleaseSpinLock(&device->lock, irql);
+		BootLog("gip: out queue full, dropping packet %02X", data[0]);
+		return;
+	}
+	uint8_t index = (device->queueHead + device->queueCount) % GIP_QUEUE_SIZE;
+	memcpy(device->queue[index], data, length);
+	if (setSequence) {
+		if (++device->sequence == 0)
+			device->sequence = 1;
+		device->queue[index][2] = device->sequence;
+	}
+	device->queueLength[index] = length;
+	device->queueCount++;
+	KfReleaseSpinLock(&device->lock, irql);
+
+	GipSendNext(device);
+}
+
+int32_t GipInterruptOutComplete(DWORD trb, int32_t status) {
+	GipDevice* device = CONTAINING_RECORD((UsbTrb*)trb, GipDevice, outTrb);
+	if (status != 0)
+		BootLog("gip: out transfer failed %X", status);
+
+	BYTE irql = KfAcquireSpinLock(&device->lock);
+	device->outBusy = false;
+	KfReleaseSpinLock(&device->lock, irql);
+
+	GipSendNext(device);
+	return 0;
+}
+
+int32_t GipInterruptInComplete(DWORD trb, int32_t status) {
+	GipDevice* device = CONTAINING_RECORD((UsbTrb*)trb, GipDevice, inTrb);
+	if (!device->active)
+		return 0;
+
+	if (status != 0) {
+		BootLog("gip: in transfer failed %X", status);
+	}
+	else {
+		const uint8_t* data = device->inBuffer;
+		// Header: command, options, sequence, payload length
+		uint32_t length = 4 + (data[3] & 0x7F);
+		if (length > device->inPacketSize)
+			length = device->inPacketSize;
+
+		if (device->packetsLogged < 16) {
+			device->packetsLogged++;
+			BootLog("gip: in %02X %02X %02X %02X len %d: %02X %02X %02X %02X %02X %02X", data[0], data[1], data[2], data[3],
+				length, data[4], data[5], data[6], data[7], data[8], data[9]);
+		}
+
+		if (data[1] & GIP_OPT_ACK) {
+			uint8_t ack[GIP_MAX_PACKET];
+			GipQueuePacket(device, ack, GipBuildAck(data, ack), false);
+		}
+
+		if (device->slot >= 0) {
+			ButtonsReport report = connectedControllers[device->slot].currentState;
+			if (GipParsePacket(data, length, &report))
+				connectedControllers[device->slot].currentState = report;
+		}
+	}
+
+	device->inTrb.buffer = device->inBuffer;
+	device->inTrb.length = device->inPacketSize;
+	device->inTrb.flags = 1;
+	device->inTrb.callback = (DWORD)GipInterruptInComplete;
+	device->inTrb.savedEndpoint = device->inTrb.endpoint;
+	return UsbdQueueAsyncTransfer(device->handle, &device->inTrb);
+}
+
+NTSTATUS GipOpenEndpoint(GipDevice* device, int direction, UsbTrb* trb, uint16_t* packetSize) {
+	usb_endpoint_descriptor* endpoint = UsbdGetEndpointDescriptor(device->handle, 0, USB_ENDPOINT_TYPE_INTERRUPT, direction);
+	if (!endpoint)
+		return STATUS_UNSUCCESSFUL;
+
+	uint16_t size = swap_endianness_16(endpoint->wMaxPacketSize) & 0x7FF;
+	if (size > GIP_MAX_PACKET)
+		size = GIP_MAX_PACKET;
+	if (packetSize)
+		*packetSize = size;
+
+	BootLog("gip: opening endpoint %02X size %d interval %d", endpoint->bEndpointAddress, size, endpoint->bInterval);
+	return UsbdOpenEndpoint(device->handle, USB_ENDPOINT_TYPE_INTERRUPT, endpoint->bEndpointAddress, size, endpoint->bInterval, (DWORD*)trb);
+}
+
+int32_t GipSetConfigurationComplete(DWORD trb, int32_t status) {
+	GipDevice* device = CONTAINING_RECORD((UsbControlTrb*)trb, GipDevice, controlTrb);
+	if (!device->active)
+		return 0;
+	if (status != 0) {
+		BootLog("gip: SET_CONFIGURATION failed %X", status);
+		return status;
+	}
+
+	NTSTATUS result = GipOpenEndpoint(device, USB_DIRECTION_IN, &device->inTrb, &device->inPacketSize);
+	if (NT_ERROR(result)) {
+		BootLog("gip: failed to open IN endpoint %X", result);
+		return result;
+	}
+	result = GipOpenEndpoint(device, USB_DIRECTION_OUT, &device->outTrb, nullptr);
+	if (NT_ERROR(result)) {
+		BootLog("gip: failed to open OUT endpoint %X", result);
+		return result;
+	}
+
+	int slot = -1;
+	for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
+		if (!connectedControllers[i].controllerDriver) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot == -1) {
+		BootLog("gip: no free controller slot");
+		return STATUS_UNSUCCESSFUL;
+	}
+
+	// The slot only needs a non null controllerDriver to count as connected, nothing dereferences it for GIP
+	Controller controller;
+	memset(&controller, 0, sizeof(Controller));
+	controller.deviceHandle = device->handle;
+	controller.controllerDriver = (HidControllerExtension*)device;
+	controller.vendorId = device->vendorId;
+	controller.productId = device->productId;
+	uint8_t userIndex = -1;
+	uint32_t context = 0x0000000010000005 + slot;
+	XamUserBindDeviceCallback(0xa7553952 + slot, context, 0, false, &userIndex);
+	controller.userIndex = userIndex;
+	controller.deviceContext = context;
+	connectedControllers[slot] = controller;
+	device->slot = slot;
+	BootLog("gip: bound to slot %d, user %d", slot, userIndex);
+
+	device->inTrb.buffer = device->inBuffer;
+	device->inTrb.length = device->inPacketSize;
+	device->inTrb.flags = 1;
+	device->inTrb.callback = (DWORD)GipInterruptInComplete;
+	device->inTrb.savedEndpoint = device->inTrb.endpoint;
+	UsbdQueueAsyncTransfer(device->handle, &device->inTrb);
+
+	int cursor = 0;
+	while (const GipInitPacket* packet = GipNextInitPacket(device->vendorId, device->productId, &cursor))
+		GipQueuePacket(device, packet->data, packet->length, true);
+	return 0;
+}
+
+BOOL GipMatchInterface(const uint8_t* descriptor, const uint8_t* deviceDescriptor, UsbdDriverObject* driverObject) {
+	// Only take the first GIP interface, the others are audio etc.
+	usb_interface_descriptor* interfaceDescriptor = (usb_interface_descriptor*)descriptor;
+	BootLog("gip: offered interface %d class %02X/%02X/%02X", interfaceDescriptor->bInterfaceNumber,
+		interfaceDescriptor->bInterfaceClass, interfaceDescriptor->bInterfaceSubClass, interfaceDescriptor->bInterfaceProtocol);
+	return interfaceDescriptor->bDescriptorType == 0x04 &&
+		interfaceDescriptor->bInterfaceNumber == 0 &&
+		interfaceDescriptor->bInterfaceClass == GIP_INTERFACE_CLASS &&
+		interfaceDescriptor->bInterfaceSubClass == GIP_INTERFACE_SUBCLASS &&
+		interfaceDescriptor->bInterfaceProtocol == GIP_INTERFACE_PROTOCOL;
+}
+
+int GipAddDevice(deviceHandle* handle) {
+	usb_device_descriptor* deviceDescriptor = UsbdGetDeviceDescriptor(handle);
+	uint16_t vendorId = swap_endianness_16(deviceDescriptor->idVendor);
+	uint16_t productId = swap_endianness_16(deviceDescriptor->idProduct);
+	BootLog("gip: add device %p vid %04X pid %04X", handle, vendorId, productId);
+
+	GipDevice* device = nullptr;
+	for (int i = 0; i < 4; i++) {
+		if (!gipDevices[i].inUse) {
+			device = &gipDevices[i];
+			break;
+		}
+	}
+	if (!device) {
+		BootLog("gip: no free device");
+		UsbdAddDeviceComplete(handle, STATUS_UNSUCCESSFUL);
+		return 0;
+	}
+
+	// Buffers stay allocated with the pool entry
+	uint8_t* inBuffer = device->inBuffer ? device->inBuffer : (uint8_t*)malloc(GIP_MAX_PACKET);
+	uint8_t* outBuffer = device->outBuffer ? device->outBuffer : (uint8_t*)malloc(GIP_MAX_PACKET);
+	memset(device, 0, sizeof(GipDevice));
+	device->inBuffer = inBuffer;
+	device->outBuffer = outBuffer;
+	device->handle = handle;
+	device->vendorId = vendorId;
+	device->productId = productId;
+	device->slot = -1;
+	device->inUse = true;
+	device->active = true;
+	handle->driver = (HidControllerExtension*)device;
+
+	UsbdAddDeviceComplete(handle, 0);
+
+	NTSTATUS status = UsbdOpenDefaultEndpoint(handle, (DWORD*)&device->controlTrb);
+	if (NT_ERROR(status)) {
+		BootLog("gip: failed to open control endpoint %X", status);
+		return status;
+	}
+
+	SendControlRequest(handle, &device->controlTrb, 0x00, 0x09, 1, 0, 0, nullptr, (DWORD)GipSetConfigurationComplete);
+	return 0;
+}
+
+int32_t GipCloseComplete(DWORD trb, int32_t status);
+
+// Same order as the kernel's HID cleanup: interrupt endpoints, then the default one, then tell usbd we're done
+void GipCloseNext(GipDevice* device) {
+	device->closeTrb.callback = (DWORD)GipCloseComplete;
+	if (device->inTrb.endpoint) {
+		device->closeTrb.savedEndpoint = device->inTrb.endpoint;
+		device->inTrb.endpoint = 0;
+		UsbdQueueCloseEndpoint(device->handle, &device->closeTrb);
+		return;
+	}
+	if (device->outTrb.endpoint) {
+		device->closeTrb.savedEndpoint = device->outTrb.endpoint;
+		device->outTrb.endpoint = 0;
+		UsbdQueueCloseEndpoint(device->handle, &device->closeTrb);
+		return;
+	}
+	if (device->controlTrb.trb.endpoint) {
+		device->closeTrb.savedEndpoint = device->controlTrb.trb.endpoint;
+		device->controlTrb.trb.endpoint = 0;
+		UsbdQueueCloseDefaultEndpoint(device->handle, (DWORD*)&device->closeTrb);
+		return;
+	}
+	BootLog("gip: removed %p", device->handle);
+	UsbdRemoveDeviceComplete(device->handle);
+	device->inUse = false;
+}
+
+int32_t GipCloseComplete(DWORD trb, int32_t status) {
+	GipCloseNext(CONTAINING_RECORD((UsbTrb*)trb, GipDevice, closeTrb));
+	return 0;
+}
+
+int GipRemoveDevice(deviceHandle* handle) {
+	GipDevice* device = (GipDevice*)handle->driver;
+	BootLog("gip: remove device %p", handle);
+	device->active = false;
+
+	if (device->slot >= 0 && connectedControllers[device->slot].controllerDriver == (HidControllerExtension*)device) {
+		XamUserBindDeviceCallback(0xa7553952 + device->slot, 0x0000000010000005 + device->slot, 0, true, 0);
+		memset(&connectedControllers[device->slot], 0, sizeof(Controller));
+	}
+	device->slot = -1;
+
+	GipCloseNext(device);
+	return 0;
+}
+
+GipDevice* FindGipDeviceForUser(DWORD user) {
+	for (int i = 0; i < 4; i++) {
+		GipDevice* device = &gipDevices[i];
+		if (device->active && device->slot >= 0 && connectedControllers[device->slot].userIndex == user)
+			return device;
+	}
+	return nullptr;
+}
+
+UsbdDriverObject GipUsbdDriverObject = { { nullptr, nullptr }, 0x00020000, GipAddDevice, GipRemoveDevice, GipMatchInterface, nullptr };
+// GIP end
+
 DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_STATE* pInputState, BYTE bAmplitude, BYTE bFrequency, BYTE bOffset) {
 	DWORD status = XamInputSetStateDetour.GetOriginal<decltype(&XamInputSetStateHook)>()(user, flags, pInputState, bAmplitude, bFrequency, bOffset);
 
@@ -1386,6 +1730,18 @@ DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_STATE* pInputState, B
 		user = 0;
 
 	if (status == ERROR_DEVICE_NOT_CONNECTED) {
+		// GIP controllers can rumble, the third argument is really the vibration
+		GipDevice* gip = FindGipDeviceForUser(user);
+		if (gip && pInputState) {
+			XINPUT_VIBRATION* vibration = (XINPUT_VIBRATION*)pInputState;
+			if (vibration->wLeftMotorSpeed != gip->lastLeftMotor || vibration->wRightMotorSpeed != gip->lastRightMotor) {
+				gip->lastLeftMotor = vibration->wLeftMotorSpeed;
+				gip->lastRightMotor = vibration->wRightMotorSpeed;
+				uint8_t packet[GIP_MAX_PACKET];
+				GipQueuePacket(gip, packet, GipBuildRumble(0, vibration->wLeftMotorSpeed, vibration->wRightMotorSpeed, packet), true);
+			}
+		}
+
 		Controller* c = nullptr;
 		for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
 			if (connectedControllers[i].controllerDriver &&
@@ -1575,6 +1931,7 @@ bool initFunctionPointers() {
 	XexGetProcedureAddress(kernelHandle, 751, &UsbdRemoveDeviceComplete);
 	XexGetProcedureAddress(kernelHandle, 189, &MmFreePhysicalMemory);
 	XexGetProcedureAddress(kernelHandle, 486, &XInputdReadStatePtr);
+	XexGetProcedureAddress(kernelHandle, 755, &UsbdRegisterDriverObject);
 
 	XexGetProcedureAddress(xamHandle, 685, &XamInputGetCapabilitiesEx);
 	XexGetProcedureAddress(xamHandle, 402, &XamInputSetState);
@@ -1682,6 +2039,13 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		XamInputGetCapabilitiesDetour.Install();
 		XInputdReadStateDetour.Install();
 		DbgPrint("EINTIM: Hooks installed\n");
+
+		// Optional, GIP controllers just won't be picked up without it
+		if (UsbdRegisterDriverObject) {
+			UsbdRegisterDriverObject(&GipUsbdDriverObject);
+			DbgPrint("EINTIM: Registered GIP driver\n");
+			BootLog("gip: driver object registered at %p", &GipUsbdDriverObject);
+		}
 
 		if (IsUsbStorageConnected()) {
 			// Controllers that were plugged in before boot need a replug, newly plugged ones go through the hook as usual

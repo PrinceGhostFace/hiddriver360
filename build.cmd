@@ -31,14 +31,14 @@ cl /nologo /c /Ox /Ob2 /Oi /Ot /GL /GF /Gy /GS- /MT /W0 /Zi ^
    /D NDEBUG /D _XBOX /D LTCG /D _MBCS %DEFINES% ^
    /I "%SRC%\xkelib" /I "%SRC%" ^
    /Fo"%OUT%\\" /Fd"%OUT%\hiddriver_cl.pdb" ^
-   "%SRC%\hid_parser.cpp" "%SRC%\main.cpp" "%SRC%\Detours.cpp" "%SRC%\mapping.cpp"
+   "%SRC%\hid_parser.cpp" "%SRC%\main.cpp" "%SRC%\Detours.cpp" "%SRC%\mapping.cpp" "%SRC%\gip.cpp"
 if errorlevel 1 goto :fail
 
 rem /XEX:NO stops link from running imagexex itself without xex.xml, the sysdll it builds below needs the config
 link /nologo /DLL /XEX:NO %ALIGN% /BASE:%BASE% /LTCG /OPT:REF /OPT:ICF /DEBUG /RELEASE ^
    /LIBPATH:"%SRC%\xkelib" xkelib.lib xapilib.lib xboxkrnl.lib ^
    /OUT:"%OUT%\hiddriver.dll" /PDB:"%OUT%\hiddriver.pdb" ^
-   "%OUT%\hid_parser.obj" "%OUT%\main.obj" "%OUT%\Detours.obj" "%OUT%\mapping.obj"
+   "%OUT%\hid_parser.obj" "%OUT%\main.obj" "%OUT%\Detours.obj" "%OUT%\mapping.obj" "%OUT%\gip.obj"
 if errorlevel 1 goto :fail
 
 imagexex /nologo /CONFIG:"%SRC%\xex.xml" /IN:"%OUT%\hiddriver.dll" /OUT:"%OUT%\hiddriver.xex"
