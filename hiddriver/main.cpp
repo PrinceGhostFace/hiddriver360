@@ -130,6 +130,13 @@ struct UsbTrb {
 	DWORD length;
 };
 
+// usbd writes the transferred length just past UsbTrb (WgcInputReportTransferComplete reads it at +0x1C, and the
+// kernel spaces its own trbs 0x28 apart). A bare UsbTrb let a finished read overwrite the next trb's endpoint.
+struct UsbTrbEx : UsbTrb {
+	DWORD actualLength;
+	DWORD reserved[4];
+};
+
 struct UsbPacket {
 	BYTE  bmRequestType;
 	BYTE  bRequest;
@@ -337,6 +344,16 @@ enum NINTENDO_HANDSHAKE_STATE {
 	HANDSHAKE,
 	DONE
 };
+
+// How a HID controller takes rumble, picked by vendor and product id
+enum RUMBLE_PROTOCOL {
+	RUMBLE_NONE,
+	RUMBLE_DS3,         // output report 0x01 over SET_REPORT
+	RUMBLE_DS4,         // output report 0x05 on the interrupt OUT endpoint
+	RUMBLE_DUALSENSE,   // output report 0x02 on the interrupt OUT endpoint
+	RUMBLE_SWITCH_PRO   // rumble report 0x10 on the interrupt OUT endpoint, after the nintendo handshake
+};
+
 struct Controller {
 	deviceHandle* deviceHandle;
 	HidControllerExtension* controllerDriver;
@@ -353,7 +370,17 @@ struct Controller {
 
 	// for nintendo specific handshake
 	NINTENDO_HANDSHAKE_STATE nintendo_handshake_state;
-	UsbTrb interruptTrb;
+	UsbTrbEx interruptTrb;      // interrupt OUT, carries the nintendo handshake and rumble
+
+	RUMBLE_PROTOCOL rumbleProtocol;
+	DWORD rumbleLock;           // xkelib spinlock
+	bool rumbleBusy;            // an output transfer is in flight
+	bool rumblePending;         // rumbleLeft/rumbleRight (or the DS3 LEDs) still have to be sent
+	bool switchVibrationEnabled;
+	uint8_t switchCounter;
+	uint16_t rumbleLeft;        // XInput motor speeds, left is the strong low frequency motor
+	uint16_t rumbleRight;
+	DWORD rumbleSentTick;
 } __declspec(align(4));
 
 struct MappingState {
@@ -470,6 +497,188 @@ int32_t noopCompleteHandler(DWORD deviceHandle, int32_t status) {
 	return 0;
 }
 
+// HID rumble start
+// Output report layouts follow Linux hid-sony, hid-playstation and hid-nintendo
+#define HID_RUMBLE_BUFFER_SIZE 64
+#define SWITCH_RUMBLE_REFRESH 100   // ms, the Switch Pro controller stops rumbling without new rumble reports
+
+// Allocated once in HidRumbleInitialize, one per controller slot
+uint8_t* hidRumbleBuffers[4];
+
+static const uint8_t ds3_output_report[36] = {
+	0x01,
+	0x01, 0xFF, 0x00, 0xFF, 0x00,   // padding, small motor duration and on/off, big motor duration and force
+	0x00, 0x00, 0x00, 0x00,
+	0x00,                           // player LEDs, bit 1 is LED 1
+	0xFF, 0x27, 0x10, 0x00, 0x32,   // LED 4 to 1 blink timing, always on
+	0xFF, 0x27, 0x10, 0x00, 0x32,
+	0xFF, 0x27, 0x10, 0x00, 0x32,
+	0xFF, 0x27, 0x10, 0x00, 0x32,
+	0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+// Switch HD rumble amplitude encoding for amplitude i/32, from log2 based formulas so nothing here needs floating point
+static const uint8_t switch_rumble_amplitudes[33] = {
+	0x00, 0x04, 0x09, 0x0D, 0x11, 0x17, 0x1B, 0x1E, 0x24, 0x29, 0x2E, 0x33, 0x37, 0x3A, 0x3E, 0x41,
+	0x44, 0x47, 0x49, 0x4C, 0x4E, 0x50, 0x53, 0x55, 0x57, 0x58, 0x5A, 0x5C, 0x5E, 0x5F, 0x61, 0x62, 0x64
+};
+
+bool HidRumbleInitialize() {
+	for (int i = 0; i < 4; i++) {
+		hidRumbleBuffers[i] = (uint8_t*)malloc(HID_RUMBLE_BUFFER_SIZE);
+		if (!hidRumbleBuffers[i])
+			return false;
+	}
+	return true;
+}
+
+RUMBLE_PROTOCOL GetRumbleProtocol(uint16_t vid, uint16_t pid) {
+	if (vid == SONY_VENDOR_ID) {
+		if (pid == DS3_PRODUCT_ID)
+			return RUMBLE_DS3;
+		if (pid == 0x05C4 || pid == 0x09CC || pid == 0x0BA0)  // DualShock 4 v1, v2, wireless adapter
+			return RUMBLE_DS4;
+		if (pid == 0x0CE6 || pid == 0x0DF2)                   // DualSense, DualSense Edge
+			return RUMBLE_DUALSENSE;
+	}
+	if (NeedsNintendoHandshake(vid, pid))
+		return RUMBLE_SWITCH_PRO;
+	return RUMBLE_NONE;
+}
+
+// One actuator: the high band at 320 Hz carries the weak motor, the low band at 160 Hz the strong one
+void SwitchEncodeRumble(uint8_t* out, uint16_t weak, uint16_t strong) {
+	uint8_t high = switch_rumble_amplitudes[(weak * 32u + 32767) / 65535];
+	uint8_t low = switch_rumble_amplitudes[(strong * 32u + 32767) / 65535];
+	out[0] = 0x00;
+	out[1] = 0x01 + high * 2;
+	out[2] = 0x40;
+	out[3] = 0x40 + low / 2;
+}
+
+// Writes the output report for the controller's current motor speeds, returns its length
+uint32_t HidBuildRumble(Controller* c, uint8_t* out) {
+	uint8_t strong = c->rumbleLeft >> 8;
+	uint8_t weak = c->rumbleRight >> 8;
+	memset(out, 0, HID_RUMBLE_BUFFER_SIZE);
+	switch (c->rumbleProtocol) {
+	case RUMBLE_DS3:
+		memcpy(out, ds3_output_report, sizeof(ds3_output_report));
+		out[3] = weak ? 1 : 0;  // the small motor is only on or off
+		out[5] = strong;
+		out[10] = 1 << ((c->userIndex & 3) + 1);
+		return sizeof(ds3_output_report);
+	case RUMBLE_DS4:
+		out[0] = 0x05;
+		out[1] = 0x01;          // only the motors are valid, the lightbar stays as it is
+		out[4] = weak;
+		out[5] = strong;
+		return 32;
+	case RUMBLE_DUALSENSE:
+		out[0] = 0x02;
+		out[1] = 0x03;          // compatible vibration and haptics select, the LEDs stay as they are
+		out[3] = weak;
+		out[4] = strong;
+		return 63;
+	case RUMBLE_SWITCH_PRO:
+		out[1] = c->switchCounter++ & 0x0F;
+		if (!c->switchVibrationEnabled) {
+			// Subcommand 0x48 enables vibration, it carries neutral rumble data
+			out[0] = 0x01;
+			SwitchEncodeRumble(out + 2, 0, 0);
+			SwitchEncodeRumble(out + 6, 0, 0);
+			out[10] = 0x48;
+			out[11] = 0x01;
+			return 12;
+		}
+		out[0] = 0x10;
+		SwitchEncodeRumble(out + 2, c->rumbleRight, c->rumbleLeft);
+		SwitchEncodeRumble(out + 6, c->rumbleRight, c->rumbleLeft);
+		return 10;
+	}
+	return 0;
+}
+
+int32_t HidRumbleComplete(DWORD trb, int32_t status);
+
+// Sends the pending rumble report unless one is still in flight, HidRumbleComplete sends whatever changed meanwhile.
+// Has to run at dispatch level like every other usbd call.
+void HidRumbleSend(int index) {
+	Controller* c = &connectedControllers[index];
+	BYTE irql = KfAcquireSpinLock(&c->rumbleLock);
+	if (!c->controllerDriver || !c->rumbleProtocol || c->rumbleBusy || !c->rumblePending ||
+		(c->rumbleProtocol == RUMBLE_SWITCH_PRO && c->nintendo_handshake_state != DONE)) {
+		KfReleaseSpinLock(&c->rumbleLock, irql);
+		return;
+	}
+	bool enabling = c->rumbleProtocol == RUMBLE_SWITCH_PRO && !c->switchVibrationEnabled;
+	uint8_t* buffer = hidRumbleBuffers[index];
+	uint32_t length = HidBuildRumble(c, buffer);
+	c->switchVibrationEnabled = true;
+	c->rumblePending = enabling;  // the actual rumble follows the enable subcommand
+	c->rumbleBusy = true;
+	c->rumbleSentTick = GetTickCount();
+	KfReleaseSpinLock(&c->rumbleLock, irql);
+
+	if (c->rumbleProtocol == RUMBLE_DS3)
+		SendControlRequest(c->deviceHandle, &c->controllerDriver->controlTrb, 0x21, 0x09, 0x0201, 0, length, buffer, (DWORD)HidRumbleComplete);
+	else
+		SendInterruptRequest(c->deviceHandle, &c->interruptTrb, buffer, length, (DWORD)HidRumbleComplete, 0);
+}
+
+// Also completes the DS3 and nintendo handshakes, which go out through the same trbs
+int32_t HidRumbleComplete(DWORD trb, int32_t status) {
+	for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
+		Controller* c = &connectedControllers[i];
+		if (trb != (DWORD)&c->interruptTrb && !(c->controllerDriver && trb == (DWORD)&c->controllerDriver->controlTrb))
+			continue;
+		if (status != 0)
+			DbgPrint("EINTIM: Output transfer failed with status %x\n", status);
+		BYTE irql = KfAcquireSpinLock(&c->rumbleLock);
+		c->rumbleBusy = false;
+		KfReleaseSpinLock(&c->rumbleLock, irql);
+		HidRumbleSend(i);
+		break;
+	}
+	return 0;
+}
+
+// Called from XamInputSetState at passive level
+void HidRumbleSet(int index, uint16_t left, uint16_t right) {
+	Controller* c = &connectedControllers[index];
+	BYTE irql = KfAcquireSpinLock(&c->rumbleLock);
+	bool changed = c->rumbleLeft != left || c->rumbleRight != right;
+	if (changed) {
+		c->rumbleLeft = left;
+		c->rumbleRight = right;
+		c->rumblePending = true;
+	}
+	KfReleaseSpinLock(&c->rumbleLock, irql);
+
+	if (changed) {
+		irql = KfRaiseIrql(2);  // DISPATCH_LEVEL
+		HidRumbleSend(index);
+		KfLowerIrql(irql);
+	}
+}
+
+// Called from the worker thread
+void HidRumbleTick() {
+	for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
+		Controller* c = &connectedControllers[i];
+		if (c->rumbleProtocol != RUMBLE_SWITCH_PRO || !(c->rumbleLeft || c->rumbleRight) ||
+			GetTickCount() - c->rumbleSentTick < SWITCH_RUMBLE_REFRESH)
+			continue;
+		BYTE irql = KfAcquireSpinLock(&c->rumbleLock);
+		c->rumblePending = true;
+		KfReleaseSpinLock(&c->rumbleLock, irql);
+		irql = KfRaiseIrql(2);
+		HidRumbleSend(i);
+		KfLowerIrql(irql);
+	}
+}
+// HID rumble end
+
 int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 	HidControllerExtension* controllerDriver = (HidControllerExtension*)((BYTE*)deviceHandle - 36);
 
@@ -571,6 +780,23 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 
 		c.controllerDriver = controllerDriver;
 
+		// The nintendo handshake opens its OUT endpoint itself, the DS3 takes its reports on the control endpoint
+		c.rumbleProtocol = GetRumbleProtocol(c.vendorId, c.productId);
+		if (c.rumbleProtocol == RUMBLE_DS4 || c.rumbleProtocol == RUMBLE_DUALSENSE) {
+			usb_endpoint_descriptor* out_descriptor = UsbdGetEndpointDescriptor(
+				controllerDriver->deviceHandle, 0, USB_ENDPOINT_TYPE_INTERRUPT, USB_DIRECTION_OUT);
+			if (!out_descriptor || NT_ERROR(UsbdOpenEndpoint(
+				controllerDriver->deviceHandle,
+				3,
+				out_descriptor->bEndpointAddress,
+				swap_endianness_16(out_descriptor->wMaxPacketSize) & 0x7FF,
+				out_descriptor->bInterval,
+				(DWORD*)&c.interruptTrb))) {
+				DbgPrint("EINTIM: Failed to open interrupt OUT endpoint, no rumble\n");
+				c.rumbleProtocol = RUMBLE_NONE;
+			}
+		}
+
 		uint8_t  userIndex = -1;
 		uint32_t context = 0x0000000010000005 + globalIndex;
 		XamUserBindDeviceCallback(0xa7553952 + globalIndex, context, 0, false, &userIndex);
@@ -582,6 +808,9 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 
 		if (NeedsDualshock3Handshake(c.vendorId, c.productId)) {
 			DbgPrint("EINTIM: Sending dualshock3 handshake!\r\n");
+			// Once it's out HidRumbleComplete sends a rumble report, which also lights the player LED
+			connectedControllers[globalIndex].rumbleBusy = true;
+			connectedControllers[globalIndex].rumblePending = true;
 			SendControlRequest(controllerDriver->deviceHandle,
 				&controllerDriver->controlTrb,
 				0x21,
@@ -589,8 +818,8 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 				Ds3FeatureStartDevice, 
 				0, 
 				sizeof(DS3_HANDSHAKE), 
-				(void*)DS3_HANDSHAKE, 
-				(DWORD)noopCompleteHandler);
+				(void*)DS3_HANDSHAKE,
+				(DWORD)HidRumbleComplete);
 		}
 		return UsbdQueueAsyncTransfer(controllerDriver->deviceHandle, &controllerDriver->interruptTrb);
 	}
@@ -1103,12 +1332,18 @@ int interruptHandler(DWORD deviceHandle, int32_t a2) {
 				return status;
 			}
 			connectedControllers[index].nintendo_handshake_state = HANDSHAKE;
-			SendInterruptRequest(driverExtension->deviceHandle, &connectedControllers[index].interruptTrb, (void*)nintendo_handshake, sizeof(nintendo_handshake), (DWORD)noopCompleteHandler);
+			connectedControllers[index].rumbleBusy = true;
+			SendInterruptRequest(driverExtension->deviceHandle, &connectedControllers[index].interruptTrb, (void*)nintendo_handshake, sizeof(nintendo_handshake), (DWORD)HidRumbleComplete);
 		}
 
-		else if (connectedControllers[index].nintendo_handshake_state == HANDSHAKE) {
+		// The trb can only be reused once HidRumbleComplete saw the handshake go out
+		else if (connectedControllers[index].nintendo_handshake_state == HANDSHAKE && !connectedControllers[index].rumbleBusy) {
+			BYTE irql = KfAcquireSpinLock(&connectedControllers[index].rumbleLock);
+			connectedControllers[index].rumbleBusy = true;
+			connectedControllers[index].rumblePending = true;  // enables vibration once this is out
 			connectedControllers[index].nintendo_handshake_state = DONE;
-			SendInterruptRequest(driverExtension->deviceHandle, &connectedControllers[index].interruptTrb, (void*)hid_only_mode, sizeof(hid_only_mode), (DWORD)noopCompleteHandler);
+			KfReleaseSpinLock(&connectedControllers[index].rumbleLock, irql);
+			SendInterruptRequest(driverExtension->deviceHandle, &connectedControllers[index].interruptTrb, (void*)hid_only_mode, sizeof(hid_only_mode), (DWORD)HidRumbleComplete);
 		}
 	}
 
@@ -1447,18 +1682,11 @@ void GipTraceEvent(DWORD code, DWORD a, DWORD b) {
 #define GipTraceEvent(code, a, b) ((void)0)
 #endif
 
-// usbd writes the transferred length just past UsbTrb (WgcInputReportTransferComplete reads it at +0x1C, and the
-// kernel spaces its own trbs 0x28 apart). A bare UsbTrb let a finished read overwrite the next trb's endpoint.
-struct GipTrb : UsbTrb {
-	DWORD actualLength;
-	DWORD reserved[4];
-};
-
 struct GipDevice {
 	deviceHandle* handle;
-	GipTrb inTrb;
-	GipTrb outTrb;
-	GipTrb closeTrb;            // used to close the endpoints one after another on removal
+	UsbTrbEx inTrb;
+	UsbTrbEx outTrb;
+	UsbTrbEx closeTrb;            // used to close the endpoints one after another on removal
 	UsbControlTrb controlTrb;
 	uint8_t* inBuffer;          // allocated once in GipInitialize, DllMain runs at passive level
 	uint8_t* outBuffer;
@@ -1808,8 +2036,10 @@ int32_t GipSetupComplete(DWORD trb, int32_t status) {
 	return 0;
 }
 
-unsigned int __stdcall GipWorkerThreadProc(void* param) {
+// GIP setup and binding, and refreshing Switch Pro rumble
+unsigned int __stdcall WorkerThreadProc(void* param) {
 	while (true) {
+		HidRumbleTick();
 		for (int i = 0; i < GIP_MAX_DEVICES; i++) {
 			GipDevice* device = &gipDevices[i];
 			if (!device->active)
@@ -1934,6 +2164,10 @@ DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_STATE* pInputState, B
 			if (connectedControllers[i].controllerDriver &&
 				connectedControllers[i].userIndex == user) {
 				c = &connectedControllers[i];
+				if (c->rumbleProtocol && pInputState) {
+					XINPUT_VIBRATION* vibration = (XINPUT_VIBRATION*)pInputState;
+					HidRumbleSet(i, vibration->wLeftMotorSpeed, vibration->wRightMotorSpeed);
+				}
 				break;
 			}
 		}
@@ -1974,8 +2208,10 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
 		memset(&state, 0, sizeof(XINPUT_STATE));
 		XInputGetState(user, &state);
 		capabilities->Gamepad = state.Gamepad;
-		capabilities->Vibration.wLeftMotorSpeed = 0;
-		capabilities->Vibration.wRightMotorSpeed = 0;
+		// Games may skip rumble for a controller that says it has no motors
+		WORD motors = c->rumbleProtocol || FindGipDeviceForUser(user) ? 0xFFFF : 0;
+		capabilities->Vibration.wLeftMotorSpeed = motors;
+		capabilities->Vibration.wRightMotorSpeed = motors;
 		return ERROR_SUCCESS;
 	}
 
@@ -2206,6 +2442,9 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 			DbgPrint("EINTIM: Failed to load mappings(JSON either doesn't exist yet or syntax error)!\r\n");
 		}
 
+		if (!HidRumbleInitialize())
+			return FALSE;
+
 		if (isDevkit) {
 			HidAddDeviceDetour = Detour((void*)0x8011AE38, (void*)HidAddDeviceHook); // 7D 88 02 A6 ? ? ? ? 94 21 ? ? 7C 7C 1B 78 ? ? ? ? 7C 7F 1B 79
 			HidRemoveDeviceDetour = Detour((void*)0x8011ADF8, (void*)HidRemoveDeviceHook); // 81 63 ? ? 39 40 ? ? 39 20 ? ? 99 4B
@@ -2230,10 +2469,10 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		// Optional, GIP controllers just won't be picked up without it
 		if (UsbdRegisterDriverObject && GipInitialize()) {
 			UsbdRegisterDriverObject(&GipUsbdDriverObject);
-			MakeThread((LPTHREAD_START_ROUTINE)GipWorkerThreadProc, nullptr);
 			DbgPrint("EINTIM: Registered GIP driver\n");
 			BootLog("gip: driver object registered at %p", &GipUsbdDriverObject);
 		}
+		MakeThread((LPTHREAD_START_ROUTINE)WorkerThreadProc, nullptr);
 
 		if (IsUsbStorageConnected()) {
 			// Controllers that were plugged in before boot need a replug, newly plugged ones go through the hook as usual
