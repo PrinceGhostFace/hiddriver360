@@ -1,4 +1,14 @@
 # HidDriver 360
+
+> [!NOTE]
+> **About this fork:** it fixes the black screen freeze on **BadUpdate** consoles. On BadUpdate everything runs from a USB stick, and hiddriver resets the whole USB driver at startup so already connected controllers get picked up. That reset pulls the rug out from under the stick the console is running from, and it locks up right after XeUnshackle ([#57](https://github.com/EinTim23/hiddriver360/issues/57), [#20](https://github.com/EinTim23/hiddriver360/issues/20), [#73](https://github.com/EinTim23/hiddriver360/issues/73)). This fork skips the reset when a USB drive is connected, so it boots fine. The only catch is that a controller plugged in before boot needs to be replugged once. Controllers plugged in after boot work like normal.
+>
+> Also fixed: a missing `return` in the capabilities hook, plus null checks so a failed lookup aborts cleanly instead of freezing.
+>
+> Tested on a retail 17559 BadUpdate console only, not on RGH or devkits.
+>
+> Heads up: this fork is kind of slopified with Claude (AI). Claude tracked the freeze down with a boot log on the console and wrote the fix. It works on my console, but review it before you trust it. The fix is also up as a PR to the original repo.
+
 Experimental on-console HID driver focussing on providing third party, non xinput controller support to the xbox 360 without dongles.
 
 ## What works
