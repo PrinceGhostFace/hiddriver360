@@ -68,6 +68,54 @@ bool IsUsbStorageConnected() {
 	return false;
 }
 
+#ifdef BOOTLOG
+#ifndef FILE_OPEN_IF
+#define FILE_OPEN_IF 0x00000003
+#endif
+#ifndef FILE_APPEND_DATA
+#define FILE_APPEND_DATA 0x0004
+#endif
+#ifndef FILE_WRITE_TO_END_OF_FILE
+#define FILE_WRITE_TO_END_OF_FILE 0xffffffff
+#endif
+
+// Debug builds only (build.cmd bootlog): appends a line to hiddriver_boot.log on the first usb drive.
+// The file gets opened and closed for every line so whatever was written survives a hard freeze, which is
+// the only way to see how far init gets on consoles without xbWatson.
+void BootLog(const char* format, ...) {
+	char line[256];
+	va_list args;
+	va_start(args, format);
+	int length = _vsnprintf(line, sizeof(line) - 2, format, args);
+	va_end(args);
+	if (length < 0)
+		length = sizeof(line) - 2;
+	line[length++] = '\r';
+	line[length++] = '\n';
+
+	static const char* paths[] = { "\\Device\\Mass0\\hiddriver_boot.log", "\\Device\\Mass1\\hiddriver_boot.log" };
+	for (int i = 0; i < 2; i++) {
+		STRING name;
+		RtlInitAnsiString(&name, paths[i]);
+		OBJECT_ATTRIBUTES attributes;
+		InitializeObjectAttributes(&attributes, &name, OBJ_CASE_INSENSITIVE, NULL);
+		IO_STATUS_BLOCK io;
+		HANDLE file;
+		if (NtCreateFile(&file, FILE_APPEND_DATA | SYNCHRONIZE, &attributes, &io, NULL, FILE_ATTRIBUTE_NORMAL,
+			FILE_SHARE_READ, FILE_OPEN_IF, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_WRITE_THROUGH) < 0)
+			continue;
+		LARGE_INTEGER end;
+		end.HighPart = -1;
+		end.LowPart = FILE_WRITE_TO_END_OF_FILE;
+		NtWriteFile(file, NULL, NULL, NULL, &io, line, length, &end);
+		NtClose(file);
+		return;
+	}
+}
+#else
+#define BootLog(...)
+#endif
+
 struct UsbTrb {
 	DWORD endpoint;
 	DWORD callback;
